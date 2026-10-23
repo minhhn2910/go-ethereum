@@ -101,11 +101,26 @@ func newObject(db *StateDB, address common.Address, acct *types.StateAccount) *s
 		addrHash:           crypto.Keccak256Hash(address[:]),
 		origin:             origin,
 		data:               *acct,
-		originStorage:      make(Storage),
+		originStorage:      originStorageFor(db, address, origin),
 		dirtyStorage:       make(Storage),
 		pendingStorage:     make(Storage),
 		uncommittedStorage: make(Storage),
 	}
+}
+
+// originStorageFor returns a retained slot map when loading an existing
+// account whose previous block already touched it. New accounts (acct == nil)
+// always get a fresh map, so a CreateAccount cannot inherit another
+// incarnation's storage.
+func originStorageFor(db *StateDB, address common.Address, acct *types.StateAccount) Storage {
+	if acct != nil {
+		if cache := db.storageCache; cache != nil {
+			if m := cache.Adopt(db.originalRoot, address); m != nil {
+				return m
+			}
+		}
+	}
+	return make(Storage)
 }
 
 func (s *stateObject) markSelfdestructed() {
@@ -194,18 +209,6 @@ func (s *stateObject) GetCommittedState(key common.Hash) common.Hash {
 	if _, destructed := s.db.stateObjectsDestruct[s.address]; destructed {
 		s.originStorage[key] = common.Hash{} // track the empty slot as origin value
 		return common.Hash{}
-	}
-
-	// Cross-block storage cache: committed value at the start of this block.
-	// Consulted after the per-object maps and before snapshot/trie.
-	if cache := s.db.storageCache; cache != nil {
-		if value, ok := cache.Get(s.db.originalRoot, s.address, key); ok {
-			s.originStorage[key] = value
-			if stats := s.db.pathStats; stats != nil {
-				stats.Cache.Add(1)
-			}
-			return value
-		}
 	}
 
 	s.db.StorageLoaded++

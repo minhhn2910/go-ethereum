@@ -158,7 +158,8 @@ type StateDB struct {
 	StorageDeleted atomic.Int64 // Number of storage slots deleted during the state transition
 
 	// Optional cross-block storage cache (nil = disabled). Shared with the
-	// backing CachingDB so it survives StateDB construction per block.
+	// backing CachingDB so retained originStorage maps survive StateDB
+	// construction per block.
 	storageCache *evmcache.StorageCache
 
 	// Optional SLOAD-path counters for the cache experiment harness.
@@ -1252,26 +1253,21 @@ func (s *StateDB) commit(deleteEmptyObjects bool) (*stateUpdate, error) {
 
 	origin := s.originalRoot
 
-	// Populate the optional cross-block storage cache from committed slots
-	// before dropping destruction markers. Writes happen only here, never
-	// mid-execution, so reverted calls cannot poison the cache. Nothing is
-	// visible to readers until EndCommit publishes the new snapshot.
-	//
-	// Invalidations must be registered before the slots, so that an account
-	// destroyed and recreated in this block keeps its new storage.
-	if cache := s.storageCache; cache != nil && cache.Enabled() && cache.BeginCommit(origin) {
+	// Keep each touched account's originStorage alive for the next block.
+	// commitStorage has already merged pending writes into those maps.
+	// Drop destroyed accounts first so a same-block recreate retains only
+	// the new incarnation.
+	if cache := s.storageCache; cache != nil && cache.Enabled() {
 		for addr := range s.stateObjectsDestruct {
-			cache.InvalidateAccount(addr)
+			cache.Drop(addr)
 		}
 		for _, obj := range s.stateObjects {
-			for key, val := range obj.originStorage {
-				cache.Put(obj.address, key, val)
+			if len(obj.originStorage) == 0 {
+				continue
 			}
-			for key, val := range obj.pendingStorage {
-				cache.Put(obj.address, key, val)
-			}
+			cache.Retain(obj.address, obj.originStorage)
 		}
-		cache.EndCommit(root)
+		cache.Commit(root)
 	}
 
 	// Clear all internal flags and update state root at the end.

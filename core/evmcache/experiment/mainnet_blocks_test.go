@@ -141,8 +141,13 @@ func mustBytes(t testing.TB, s string) []byte {
 
 func loadBlocks(t testing.TB) []blockFixture {
 	t.Helper()
+	return loadNamedBlocks(t, mainnetBlocks)
+}
+
+func loadNamedBlocks(t testing.TB, names []string) []blockFixture {
+	t.Helper()
 	var out []blockFixture
-	for _, num := range mainnetBlocks {
+	for _, num := range names {
 		dir := filepath.Join(blockDataDir(), num)
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -231,6 +236,7 @@ type replayResult struct {
 	pathOrigin, pathCache      uint64
 	pathPending, pathBackend   uint64
 	cacheEntries               int
+	cacheAccounts              int
 	purges                     uint64
 }
 
@@ -315,10 +321,7 @@ func replay(t testing.TB, blocks []blockFixture, opts replayOpts) replayResult {
 	for _, blk := range blocks {
 		// Path counters live on the StateDB, which is replaced after every
 		// commit, so they have to be re-armed and drained per block.
-		var stats *evmcache.StoragePathStats
-		if opts.pathStats {
-			stats = st.EnablePathStats()
-		}
+		stats := st.EnablePathStats()
 		coinbase := common.HexToAddress(blk.env.Coinbase)
 		random := common.HexToHash(blk.env.Random)
 		blockCtx := vm.BlockContext{
@@ -403,10 +406,12 @@ func replay(t testing.TB, blocks []blockFixture, opts replayOpts) replayResult {
 
 	res.root = root
 	scStats, kcStats := sc.Stats(), kc.Stats()
-	res.storageHits, res.storageMisses = scStats.Hits, scStats.Misses
+	// Design D has no distinct lookup path: cross-block hits land in originStorage.
+	res.storageHits, res.storageMisses = res.pathOrigin, res.pathBackend
 	res.keccakHits, res.keccakMisses = kcStats.Hits, kcStats.Misses
 	res.purges = scStats.Purges
 	res.cacheEntries = sc.Len()
+	res.cacheAccounts = sc.Accounts()
 	return res
 }
 
@@ -550,13 +555,13 @@ func requireSameWork(t *testing.T, configs []cacheConfig, ms []measurement) {
 }
 
 func writeSummary(b *strings.Builder, configs []cacheConfig, ms []measurement) {
-	fmt.Fprintf(b, "| Configuration | ns/tx (median) | vs both off | ns/tx (best pass) | vs both off | storage hit rate | keccak hit rate |\n")
+	fmt.Fprintf(b, "| Configuration | ns/tx (median) | vs both off | ns/tx (best pass) | vs both off | origin / backend | keccak hit rate |\n")
 	fmt.Fprintf(b, "|---|---:|---:|---:|---:|---:|---:|\n")
 	for k, c := range configs {
 		shr, khr := "—", "—"
 		if c.storage {
 			r := ms[k].last
-			shr = fmt.Sprintf("%.1f%% (%d/%d)", 100*r.storageHitRate(), r.storageHits, r.storageHits+r.storageMisses)
+			shr = fmt.Sprintf("%d / %d", r.pathOrigin, r.pathBackend)
 		}
 		if c.keccak {
 			r := ms[k].last
@@ -715,14 +720,13 @@ func TestMainnetBlocksCacheImpact(t *testing.T) {
 		})
 		fmt.Fprintf(&b, "\n### Where committed-state reads resolved (%s, storage cache on)\n\n", w.label)
 		fmt.Fprintf(&b, "| Path | Count | Share |\n|---|---:|---:|\n")
-		sum := paths.pathPending + paths.pathOrigin + paths.pathCache + paths.pathBackend
+		sum := paths.pathPending + paths.pathOrigin + paths.pathBackend
 		for _, row := range []struct {
 			name string
 			n    uint64
 		}{
 			{"pending (written by an earlier tx in this block)", paths.pathPending},
-			{"origin (already loaded earlier in this block)", paths.pathOrigin},
-			{"cross-block storage cache", paths.pathCache},
+			{"origin (this block or retained from an earlier one)", paths.pathOrigin},
 			{"backend (snapshot / trie)", paths.pathBackend},
 		} {
 			fmt.Fprintf(&b, "| %s | %d | %.1f%% |\n", row.name, row.n, 100*float64(row.n)/float64(sum))
@@ -733,32 +737,19 @@ func TestMainnetBlocksCacheImpact(t *testing.T) {
 		}
 	}
 
-	// The commit-side rebuild scales with the budget while the hit rate does
-	// not, so on a workload with little cross-block reuse a smaller table can
-	// net out ahead of a larger one.
-	fmt.Fprintf(&b, "\n### Storage cache budget sweep (cold, storage only)\n\n")
-	fmt.Fprintf(&b, "| Budget | ns/tx | vs both off | hit rate | entries held |\n|---:|---:|---:|---:|---:|\n")
-	sweep := []cacheConfig{{name: "off"}}
-	for _, size := range []int{1024, 4096, 16384, 65536} {
-		sweep = append(sweep, cacheConfig{
-			name: fmt.Sprintf("%d", size), storage: true, storageSize: size,
-		})
-	}
-	sm := measureConfigs(t, blocks, sweep, false, mainnetRepeats)
-	requireSameWork(t, sweep, sm)
-	for k, c := range sweep[1:] {
-		r := sm[k+1]
-		fmt.Fprintf(&b, "| %s | %.0f | %+.2f%% | %.1f%% | %d |\n", c.name, r.nsPerTx(),
-			100*(sm[0].nsPerTx()-r.nsPerTx())/sm[0].nsPerTx(), 100*r.last.storageHitRate(), r.last.cacheEntries)
-	}
+	// Design D has no entry budget; the size argument is ignored. Report how
+	// many slots the storage-only arm actually retained.
+	fmt.Fprintf(&b, "\n### Storage cache retention (cold, storage only)\n\n")
+	fmt.Fprintf(&b, "Design D retains whatever originStorage maps the blocks produced. "+
+		"%d slots held at the end of the cold storage-only run.\n",
+		cold[2].last.cacheEntries)
 
 	writeBudget(&b, cold, warm)
 }
 
-// writeBudget converts hit counts into the wall time they can possibly save.
-// Timings on a 75 ms run sit close to the interference floor, so counting the
-// saved work is the more trustworthy estimate of what the caches are worth
-// here.
+// writeBudget converts backend-read reductions into the wall time they can
+// possibly save. Timings on a short run sit close to the interference floor,
+// so counting the saved work is the more trustworthy estimate.
 func writeBudget(b *strings.Builder, cold, warm []measurement) {
 	const (
 		offIdx     = 0
@@ -767,12 +758,17 @@ func writeBudget(b *strings.Builder, cold, warm []measurement) {
 	)
 	runNs := median(cold[offIdx].samples)
 
-	// Marginal value of a storage cache hit, measured rather than assumed:
-	// the pre-warmed arm does identical work to the cold arm except that this
-	// many reads resolve in the cache instead of going to the backend.
-	coldHits := float64(cold[storageIdx].last.storageHits)
-	warmHits := float64(warm[storageIdx].last.storageHits)
-	perStorageHit := (median(cold[storageIdx].samples) - median(warm[storageIdx].samples)) / (warmHits - coldHits)
+	// Reads moved off the backend by retention: originStorage now holds what
+	// a cache-off arm would have fetched from the trie.
+	offBackend := float64(cold[offIdx].last.pathBackend)
+	coldBackend := float64(cold[storageIdx].last.pathBackend)
+	warmBackend := float64(warm[storageIdx].last.pathBackend)
+	coldHits := offBackend - coldBackend
+	warmHits := offBackend - warmBackend
+	perStorageHit := 0.0
+	if d := warmHits - coldHits; d != 0 {
+		perStorageHit = (median(cold[storageIdx].samples) - median(warm[storageIdx].samples)) / d
+	}
 
 	// Marginal value of a keccak cache hit, from the same microbenchmark the
 	// K-A cell uses: a 64-byte mapping-key hash against a table hit.
@@ -812,8 +808,8 @@ func writeBudget(b *strings.Builder, cold, warm []measurement) {
 		"lookup, both tables at 65536 keys — and is the one that applies to a full node.\n",
 		warmHits-coldHits)
 
-	// The storage cache is not free: every commit restages and republishes.
-	// That cost lands whether or not the block gets any hits.
+	// The storage cache is not free: Retain and a root retag run at every
+	// commit, whether or not the block gets any hits.
 	var commitOff, commitOn float64
 	for i := range cold[offIdx].commit[0] {
 		commitOff += blockStat(cold[offIdx].commit, i)
@@ -823,7 +819,7 @@ func writeBudget(b *strings.Builder, cold, warm []measurement) {
 
 	fmt.Fprintf(b, "\n### Storage cache, net of its own commit overhead\n\n")
 	fmt.Fprintf(b, "Committing the three blocks takes %.2f ms with the cache off and %.2f ms "+
-		"with it on, so staging and republishing costs %.0f µs per three blocks. Against that:\n\n",
+		"with it on, so Retain and retag cost %.0f µs per three blocks. Against that:\n\n",
 		commitOff, commitOn, overhead/1e3)
 	fmt.Fprintf(b, "| Scenario | Saved | Commit overhead | Net |\n|---|---:|---:|---:|\n")
 	for _, row := range []struct {
@@ -867,11 +863,13 @@ func snapshotSaving() float64 {
 
 	root := common.HexToHash("0x01")
 	sc := evmcache.NewStorageCache(wide)
-	sc.BeginCommit(common.Hash{})
+	held := make(map[common.Hash]common.Hash, wide)
 	for _, k := range keys {
-		sc.Put(addr, k, val)
+		held[k] = val
 	}
-	sc.EndCommit(root)
+	sc.Retain(addr, held)
+	sc.Commit(root)
+	adopted := sc.Adopt(root, addr)
 
 	const iters = 2_000_000
 	goruntime.GC()
@@ -888,7 +886,7 @@ func snapshotSaving() float64 {
 	goruntime.GC()
 	start = time.Now()
 	for i := 0; i < iters; i++ {
-		sc.Get(root, addr, keys[i%wide])
+		_ = adopted[keys[i%wide]]
 	}
 	cached := float64(time.Since(start).Nanoseconds()) / iters
 

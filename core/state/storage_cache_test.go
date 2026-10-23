@@ -67,8 +67,10 @@ func TestStorageCacheWriteThenReadSameBlock(t *testing.T) {
 		t.Fatalf("same-block read = %x, want %x", got, want)
 	}
 	// Cache is not written mid-execution.
-	if _, ok := cache.Get(st.originalRoot, addr, slot); ok {
-		t.Fatal("cache populated before commit")
+	if m := cache.Adopt(st.originalRoot, addr); m != nil {
+		if _, ok := m[slot]; ok {
+			t.Fatal("cache populated before commit")
+		}
 	}
 }
 
@@ -89,9 +91,9 @@ func TestStorageCacheWriteBlockNReadBlockN1(t *testing.T) {
 	if got != want {
 		t.Fatalf("block N+1 read = %x, want %x", got, want)
 	}
-	_, _, _, cacheHits, backend := stats.Snapshot()
-	if cacheHits == 0 {
-		t.Fatalf("expected a cross-block cache hit, stats cache=%d backend=%d root=%s", cacheHits, backend, root)
+	_, _, origin, _, backend := stats.Snapshot()
+	if origin == 0 || backend != 0 {
+		t.Fatalf("expected a retained originStorage hit, stats origin=%d backend=%d root=%s", origin, backend, root)
 	}
 }
 
@@ -210,8 +212,8 @@ func TestStorageCacheSameValueWriteIsNoop(t *testing.T) {
 	if baseRoot != repeatRoot {
 		t.Fatalf("same-value writes changed the root: %s vs %s", baseRoot, repeatRoot)
 	}
-	if got, ok := cache.Get(repeatRoot, addr, slot); !ok || got != val {
-		t.Fatalf("cache after no-op writes = %x %v, want %x true", got, ok, val)
+	if m := cache.Adopt(repeatRoot, addr); m == nil || m[slot] != val {
+		t.Fatalf("cache after no-op writes = %v, want %x", m, val)
 	}
 }
 

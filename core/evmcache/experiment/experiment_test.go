@@ -177,22 +177,12 @@ func runSA(t *testing.T, b *strings.Builder) {
 		wideMap[k] = val
 	}
 
-	hotCache := evmcache.NewStorageCache(1024)
-	hotCache.Put(addr, slot, val)
-	hotCache.EndCommit(root)
-
+	// Design D: the cache *is* originStorage. Seed a retained map and Adopt
+	// it once, the way newObject does at the start of a block.
 	wideCache := evmcache.NewStorageCache(wide)
-	for _, k := range keys {
-		wideCache.Put(addr, k, val)
-	}
-	wideCache.EndCommit(root)
-
-	countedCache := evmcache.NewStorageCache(wide)
-	for _, k := range keys {
-		countedCache.Put(addr, k, val)
-	}
-	countedCache.EndCommit(root)
-	countedCache.SetStatsEnabled(true)
+	wideCache.Retain(addr, wideMap)
+	wideCache.Commit(root)
+	adopted := wideCache.Adopt(root, addr)
 
 	type cell struct {
 		name string
@@ -215,27 +205,20 @@ func runSA(t *testing.T, b *strings.Builder) {
 			}
 			_ = sink
 		}},
-		{"storage cache hit (1 key, in L1)", func(b *testing.B) {
+		{"adopted originStorage hit (65536 keys)", func(b *testing.B) {
 			var sink common.Hash
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				sink, _ = hotCache.Get(root, addr, slot)
+				sink = adopted[keys[i%wide]]
 			}
 			_ = sink
 		}},
-		{"storage cache hit (65536 keys)", func(b *testing.B) {
+		{"Adopt per lookup (65536 keys)", func(b *testing.B) {
 			var sink common.Hash
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				sink, _ = wideCache.Get(root, addr, keys[i%wide])
-			}
-			_ = sink
-		}},
-		{"storage cache hit (65536 keys, stats on)", func(b *testing.B) {
-			var sink common.Hash
-			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
-				sink, _ = countedCache.Get(root, addr, keys[i%wide])
+				m := wideCache.Adopt(root, addr)
+				sink = m[keys[i%wide]]
 			}
 			_ = sink
 		}},
@@ -281,7 +264,7 @@ func runSA(t *testing.T, b *strings.Builder) {
 	}
 
 	fmt.Fprintf(b, "| Level | ns/op | allocs/op | bytes/op |\n|---|---:|---:|---:|\n")
-	var mapNs, cacheNs, snapNs float64
+	var mapNs, adoptedNs, snapNs float64
 	for _, c := range cells {
 		res := testing.Benchmark(c.fn)
 		ns := float64(res.NsPerOp())
@@ -289,16 +272,16 @@ func runSA(t *testing.T, b *strings.Builder) {
 		switch c.name {
 		case "originStorage map hit (65536 keys)":
 			mapNs = ns
-		case "storage cache hit (65536 keys)":
-			cacheNs = ns
+		case "adopted originStorage hit (65536 keys)":
+			adoptedNs = ns
 		case "snapshot fastcache hit (65536 keys)":
 			snapNs = ns
 		}
 	}
 
-	fmt.Fprintf(b, "\nAt equal cardinality the cache is %.1f ns above a plain map (%.1f vs %.1f); "+
-		"both hash a comparable key with the runtime hasher, and the cache adds an atomic pointer load "+
-		"plus a root comparison.\n", cacheNs-mapNs, cacheNs, mapNs)
+	fmt.Fprintf(b, "\nDesign D: an adopted map is the same pointer as originStorage (%.1f vs %.1f ns). "+
+		"The per-SLOAD cache cost over stock geth is zero; Adopt is paid once per contract per block.\n",
+		adoptedNs, mapNs)
 	fmt.Fprintf(b, "\nH1 prize (snapshot hit − map hit, equal cardinality) = %.1f ns.\n", snapNs-mapNs)
 	if snapNs-mapNs < 50 {
 		fmt.Fprintf(b, "Gate: snapshot hit is within a few tens of ns of a map hit — H1 is weak; H2 (cross-block) is the remaining claim.\n")
@@ -306,33 +289,33 @@ func runSA(t *testing.T, b *strings.Builder) {
 		fmt.Fprintf(b, "Gate: snapshot hit is substantially more expensive than a map hit — H1 is live.\n")
 	}
 
-	// Copy-on-write buys the lock-free lookup by rebuilding maps on the commit
-	// path. That cost scales with how much the cache holds, not with how much
-	// the block wrote, so it is priced separately and across sizes.
-	fmt.Fprintf(b, "\n### Commit cost (staging + fold + publish), mean over 64 commits\n\n")
-	fmt.Fprintf(b, "| Budget (entries) | Slots staged per block | ms/commit |\n|---:|---:|---:|\n")
-	for _, budget := range []int{1024, 4096, 16384, 65536} {
+	fmt.Fprintf(b, "\n### Commit cost (in-place update + Retain + retag), mean over 64 commits\n\n")
+	fmt.Fprintf(b, "| Resident slots | Slots written per block | µs/commit |\n|---:|---:|---:|\n")
+	for _, resident := range []int{1024, 4096, 16384, 65536} {
 		for _, staged := range []int{256, 2048} {
 			const commits = 64
-			c := evmcache.NewStorageCache(budget)
-			for i := 0; i < budget && i < wide; i++ {
-				c.Put(addr, keys[i], val)
+			c := evmcache.NewStorageCache(resident)
+			m := make(map[common.Hash]common.Hash, resident)
+			for i := 0; i < resident && i < wide; i++ {
+				m[keys[i]] = val
 			}
-			c.EndCommit(root)
+			c.Retain(addr, m)
+			c.Commit(root)
 
 			start := time.Now()
 			for n := 0; n < commits; n++ {
+				held := c.Adopt(root, addr)
 				for j := 0; j < staged; j++ {
-					c.Put(addr, keys[(n*staged+j)%wide], common.Hash{byte(n)})
+					held[keys[(n*staged+j)%wide]] = common.Hash{byte(n)}
 				}
-				c.EndCommit(root)
+				c.Retain(addr, held)
+				c.Commit(root)
 			}
-			ms := float64(time.Since(start).Microseconds()) / 1000 / commits
-			fmt.Fprintf(b, "| %d | %d | %.2f |\n", budget, staged, ms)
+			us := float64(time.Since(start).Microseconds()) / commits
+			fmt.Fprintf(b, "| %d | %d | %.2f |\n", resident, staged, us)
 		}
 	}
-	fmt.Fprintf(b, "\nThe base is only rebuilt when the delta outgrows an eighth of the budget, "+
-		"after %d idle commits, or on a self-destruct, so these are amortized figures.\n", 32)
+	fmt.Fprintf(b, "\nNo maps are copied. Retain updates a length counter; Commit stores the new root.\n")
 	fmt.Fprintln(b)
 }
 
@@ -355,51 +338,50 @@ func runSB(t *testing.T, b *strings.Builder) {
 	st = commitReload(t, st, sdb)
 	cfg.State = st
 
-	// Second block: originStorage starts empty; this is the H2 gap.
+	// Second block: originStorage is the map retained from block 1.
 	st.EnablePathStats().Reset()
-	sc.ResetStats()
 	start = time.Now()
 	gas2 := runTransfers(t, cfg, st, users, transfers)
 	elapsed2 := time.Since(start)
-	d, p, o, c, backend := st.PathStats().Snapshot()
-	cst := sc.Stats()
+	d, p, o, _, backend := st.PathStats().Snapshot()
 
 	fmt.Fprintf(b, "Block 1: %d transfers in %s, gas=%d (warms originStorage + snapshot/trie).\n", transfers, elapsed, gas)
 	fmt.Fprintf(b, "Block 2: %d transfers in %s, gas=%d.\n\n", transfers, elapsed2, gas2)
 	fmt.Fprintf(b, "| Path | Count |\n|---|---:|\n")
-	fmt.Fprintf(b, "| dirty | %d |\n| pending | %d |\n| origin | %d |\n| evm storage cache | %d |\n| backend (snapshot/trie) | %d |\n", d, p, o, c, backend)
-	fmt.Fprintf(b, "\nCross-block cache: hits=%d misses=%d hit-rate=%.1f%%\n", cst.Hits, cst.Misses, 100*cst.HitRate())
+	fmt.Fprintf(b, "| dirty | %d |\n| pending | %d |\n| origin (includes retained) | %d |\n| backend (snapshot/trie) | %d |\n", d, p, o, backend)
+	fmt.Fprintf(b, "\nUnder Design D there is no distinct cache path: a cross-block hit is an originStorage probe. "+
+		"Block 2 origin=%d backend=%d (backend should be near zero if the working set was retained).\n", o, backend)
 	fmt.Fprintf(b, "\nGas is identical across cache on/off by construction of EIP-2929 (access list resets every tx); this table is performance-only.\n\n")
 }
 
 func runSD(t *testing.T, b *strings.Builder) {
 	fmt.Fprintf(b, "## S-D — Hit-rate sweep\n\n")
-	fmt.Fprintf(b, "### D1 — Synthetic (cache Get/Put, no EVM)\n\n")
-	fmt.Fprintf(b, "Table budget is 128 entries, so pool=256 cannot fit and forces misses.\n\n")
-	fmt.Fprintf(b, "| Key pool | Measured hit rate | ns/op | allocs/op |\n|---:|---:|---:|---:|\n")
+	fmt.Fprintf(b, "### D1 — Synthetic (adopted map lookup, no EVM)\n\n")
+	fmt.Fprintf(b, "Design D has no entry budget; every seeded slot hits. ns/op is a plain map probe.\n\n")
+	fmt.Fprintf(b, "| Key pool | ns/op | allocs/op |\n|---:|---:|---:|\n")
 
-	const cacheSlots = 128
 	for _, pool := range []int{8, 64, 128, 256} {
-		c := newStorageCache(cacheSlots)
+		c := newStorageCache(pool)
 		root := common.Hash{1}
 		addr := common.Address{0x01}
+		m := make(map[common.Hash]common.Hash, pool)
 		for i := 0; i < pool; i++ {
-			c.Put(addr, intHash(i), intHash(i+1))
+			m[intHash(i)] = intHash(i + 1)
 		}
-		c.EndCommit(root)
-		c.ResetStats()
+		c.Retain(addr, m)
+		c.Commit(root)
+		held := c.Adopt(root, addr)
 		res := testing.Benchmark(func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				c.Get(root, addr, intHash(i%pool))
+				_ = held[intHash(i%pool)]
 			}
 		})
-		st := c.Stats()
-		fmt.Fprintf(b, "| %d | %.1f%% | %d | %d |\n", pool, 100*st.HitRate(), res.NsPerOp(), res.AllocsPerOp())
+		fmt.Fprintf(b, "| %d | %d | %d |\n", pool, res.NsPerOp(), res.AllocsPerOp())
 	}
 
 	fmt.Fprintf(b, "\n### D2 — ERC-20 address-set sweep\n\n")
-	fmt.Fprintf(b, "| Addresses | Cache | ns/transfer | gas | hit rate | root match |\n|---:|---|---:|---:|---:|---|\n")
+	fmt.Fprintf(b, "| Addresses | Cache | ns/transfer | gas | origin share | root match |\n|---:|---|---:|---:|---:|---|\n")
 
 	noise := erc20Cell(t, 64, 256, false, false)
 	fmt.Fprintf(b, "| noise floor (off vs off, N=64) | off | %.0f vs %.0f (%.2f%%) | %d | n/a | %v |\n",
@@ -414,10 +396,10 @@ func runSD(t *testing.T, b *strings.Builder) {
 		}
 	}
 
-	// Worst case: every transfer touches a fresh pair of accounts and the
-	// budget is 8 entries, so the cache is pure overhead. It must not regress.
+	// Unique pairings: little slot reuse. Design D has no budget, so this is
+	// overhead of Retain/Adopt on maps that barely help, not eviction.
 	worst := erc20Cell(t, 256, 256, true, true)
-	fmt.Fprintf(b, "| 256 unique, 8-entry budget (worst) | on vs off | %.0f vs %.0f (%.2f%%) | %d | %.1f%% | %v |\n",
+	fmt.Fprintf(b, "| 256 unique (low reuse) | on vs off | %.0f vs %.0f (%.2f%%) | %d | %.1f%% | %v |\n",
 		worst.onNs, worst.offNs, worst.speedup(), worst.gas, 100*worst.hitRate, worst.rootMatch)
 	if !worst.rootMatch {
 		t.Fatal("worst-case state root mismatch")
@@ -426,9 +408,9 @@ func runSD(t *testing.T, b *strings.Builder) {
 	runCrossBlock(t, b)
 }
 
-// runCrossBlock is the case originStorage structurally cannot serve: the cache
-// has to survive five consecutive commits, so block 1 pays the cold cost and
-// blocks 2-5 read what earlier blocks committed.
+// runCrossBlock is the case stock originStorage cannot serve: the retained
+// maps have to survive five consecutive commits, so block 1 pays the cold
+// cost and blocks 2-5 read what earlier blocks committed.
 func runCrossBlock(t *testing.T, b *strings.Builder) {
 	const (
 		naddr    = 64
@@ -538,8 +520,7 @@ func runSE(t *testing.T, b *strings.Builder) {
 		"not the %d of the initial SSTORE_SET.\n",
 		perExtra, params.WarmStorageReadCostEIP2929, 2*vm.GasFastestStep, params.SstoreSetGasEIP2200)
 	fmt.Fprintf(b, "The committed slot and the cache contents are unchanged, and the cache holds one "+
-		"entry however many times the slot is rewritten (%d inserts staged for 1 entry at 3 writes).\n\n",
-		three.inserts)
+		"entry however many times the slot is rewritten.\n\n")
 
 	if got := two.gas - one.gas; got != perExtra {
 		t.Fatalf("second identical SSTORE cost %d gas, want %d", got, perExtra)
@@ -723,11 +704,7 @@ func erc20Cell(t *testing.T, naddr, transfers int, storageOn, unique bool) bench
 	runOnce := func(enabled bool) (ns float64, gas uint64, root common.Hash, hit float64) {
 		var sc *evmcache.StorageCache
 		if enabled {
-			slots := 4096
-			if unique {
-				slots = 8 // force misses: working set ≫ budget
-			}
-			sc = newStorageCache(slots)
+			sc = newStorageCache(4096)
 		}
 		st, sdb, cfg := newHarness(t, sc, nil)
 		users := makeAddrs(naddr)
@@ -736,11 +713,7 @@ func erc20Cell(t *testing.T, naddr, transfers int, storageOn, unique bool) bench
 		}
 		st = commitReload(t, st, sdb)
 		cfg.State = st
-		if sc != nil {
-			sc.ResetStats()
-		}
-		// runUniqueTransfers is capped by the address set, so the divisor has
-		// to be the number of transfers actually issued.
+		stats := st.EnablePathStats()
 		issued := transfers
 		start := time.Now()
 		if unique {
@@ -752,10 +725,11 @@ func erc20Cell(t *testing.T, naddr, transfers int, storageOn, unique bool) bench
 			gas = runTransfers(t, cfg, st, users, transfers)
 		}
 		ns = float64(time.Since(start).Nanoseconds()) / float64(issued)
-		st, root = mustCommit(t, st, sdb)
-		if sc != nil {
-			hit = sc.Stats().HitRate()
+		_, _, origin, _, backend := stats.Snapshot()
+		if origin+backend > 0 {
+			hit = float64(origin) / float64(origin+backend)
 		}
+		st, root = mustCommit(t, st, sdb)
 		return
 	}
 	if !storageOn {
@@ -835,34 +809,32 @@ func erc20CrossBlock(t *testing.T, naddr, nblocks, perBlock int) crossBlockResul
 		}
 		st = commitReload(t, st, sdb)
 
-		var prevHits, prevMisses uint64
 		for i := 0; i < nblocks; i++ {
 			cfg.State = st
+			stats := st.EnablePathStats()
 			start := time.Now()
 			out.gas += runTransfers(t, cfg, st, users, perBlock)
 			out.ns = append(out.ns, float64(time.Since(start).Nanoseconds())/float64(perBlock))
+
+			_, _, origin, _, backend := stats.Snapshot()
+			rate := 0.0
+			if origin+backend > 0 {
+				rate = float64(origin) / float64(origin+backend)
+			}
+			out.hit = append(out.hit, rate)
 
 			commitStart := time.Now()
 			st, out.root = mustCommit(t, st, sdb)
 			out.commitMs = append(out.commitMs, float64(time.Since(commitStart).Microseconds())/1000)
 
-			// Differencing the cumulative counters gives a per-block hit rate
-			// without resetting the purge count the caller asserts on.
-			s := sc.Stats()
-			dh, dm := s.Hits-prevHits, s.Misses-prevMisses
-			prevHits, prevMisses = s.Hits, s.Misses
-			rate := 0.0
-			if dh+dm > 0 {
-				rate = float64(dh) / float64(dh+dm)
-			}
-			out.hit = append(out.hit, rate)
-			out.entries = append(out.entries, sc.Len())
-			out.purges = s.Purges
-
-			// The tag must follow the chain head for the whole run; if it
-			// ever lagged, later blocks would silently stop hitting.
-			if sc != nil && sc.Root() != out.root {
-				t.Fatalf("block %d: cache root tag = %s, want %s", i+1, sc.Root(), out.root)
+			if sc != nil {
+				out.entries = append(out.entries, sc.Len())
+				out.purges = sc.Stats().Purges
+				if sc.Root() != out.root {
+					t.Fatalf("block %d: cache root tag = %s, want %s", i+1, sc.Root(), out.root)
+				}
+			} else {
+				out.entries = append(out.entries, 0)
 			}
 		}
 		return out

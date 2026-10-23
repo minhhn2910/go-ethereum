@@ -160,8 +160,8 @@ type CachingDB struct {
 	codeSizeCache *lru.Cache[common.Hash, int]
 	pointCache    *utils.PointCache
 
-	// storageCache is an optional cross-block (address, slot) cache. Nil
-	// disables it. Shared by every StateDB opened from this database.
+	// storageCache is an optional cross-block store of per-address slot maps.
+	// Nil disables it. Shared by every StateDB opened from this database.
 	storageCache *evmcache.StorageCache
 }
 

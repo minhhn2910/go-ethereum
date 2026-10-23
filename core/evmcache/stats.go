@@ -42,8 +42,8 @@ func (s Stats) HitRate() float64 {
 type StoragePathStats struct {
 	Dirty   atomic.Uint64 // served from dirtyStorage (current tx writes)
 	Pending atomic.Uint64 // served from pendingStorage (earlier tx in block)
-	Origin  atomic.Uint64 // served from originStorage (already loaded this block)
-	Cache   atomic.Uint64 // served from the cross-block storage cache
+	Origin  atomic.Uint64 // served from originStorage (this block or retained)
+	Cache   atomic.Uint64 // unused under Design D (cross-block hits land in Origin)
 	Backend atomic.Uint64 // snapshot / trie / disk
 }
 

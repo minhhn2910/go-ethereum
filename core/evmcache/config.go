@@ -20,9 +20,8 @@
 package evmcache
 
 const (
-	// DefaultStorageSlots is the entry budget for the cross-block storage
-	// cache. Rebuilding a map this size costs about half a millisecond per
-	// commit, so a smaller budget is often the better trade.
+	// DefaultStorageSlots is accepted by NewStorageCache for call-site
+	// compatibility. Design D retains maps without a hard entry budget.
 	DefaultStorageSlots = 65536
 
 	// DefaultKeccakSlots is a small table for SHA3 inputs of at most 64

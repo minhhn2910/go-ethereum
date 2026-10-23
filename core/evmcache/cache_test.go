@@ -23,6 +23,25 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
+func seed(c *StorageCache, root common.Hash, addr common.Address, slot, val common.Hash) {
+	m := c.Adopt(root, addr)
+	if m == nil {
+		m = make(map[common.Hash]common.Hash)
+	}
+	m[slot] = val
+	c.Retain(addr, m)
+	c.Commit(root)
+}
+
+func lookup(c *StorageCache, root common.Hash, addr common.Address, slot common.Hash) (common.Hash, bool) {
+	m := c.Adopt(root, addr)
+	if m == nil {
+		return common.Hash{}, false
+	}
+	v, ok := m[slot]
+	return v, ok
+}
+
 func TestStorageCacheHitMiss(t *testing.T) {
 	c := NewStorageCache(16)
 	root := common.HexToHash("0x01")
@@ -30,284 +49,138 @@ func TestStorageCacheHitMiss(t *testing.T) {
 	slot := common.HexToHash("0x02")
 	val := common.HexToHash("0x03")
 
-	if _, ok := c.Get(root, addr, slot); ok {
+	if _, ok := lookup(c, root, addr, slot); ok {
 		t.Fatal("empty cache hit")
 	}
-	if !c.BeginCommit(common.Hash{}) {
-		t.Fatal("empty cache should accept first commit")
-	}
-	c.Put(addr, slot, val)
-	c.EndCommit(root)
+	seed(c, root, addr, slot, val)
 
-	got, ok := c.Get(root, addr, slot)
+	got, ok := lookup(c, root, addr, slot)
 	if !ok || got != val {
 		t.Fatalf("hit = %v %v, want %v true", got, ok, val)
 	}
-	// Wrong root is a miss, never a stale hit.
-	if _, ok := c.Get(common.HexToHash("0xff"), addr, slot); ok {
+	if _, ok := lookup(c, common.HexToHash("0xff"), addr, slot); ok {
 		t.Fatal("hit with mismatched root")
 	}
-	// Address is part of the key.
-	if _, ok := c.Get(root, common.Address{0xbb}, slot); ok {
+	if _, ok := lookup(c, root, common.Address{0xbb}, slot); ok {
 		t.Fatal("hit with different address, same slot")
 	}
 }
 
 func TestStorageCacheDisable(t *testing.T) {
 	c := NewStorageCache(8)
-	c.Put(common.Address{1}, common.Hash{2}, common.Hash{3})
-	c.EndCommit(common.Hash{4})
+	root := common.Hash{4}
+	addr, slot, val := common.Address{1}, common.Hash{2}, common.Hash{3}
+	seed(c, root, addr, slot, val)
 	c.SetEnabled(false)
 	if c.Enabled() {
 		t.Fatal("expected disabled")
 	}
-	if _, ok := c.Get(common.Hash{4}, common.Address{1}, common.Hash{2}); ok {
+	if _, ok := lookup(c, root, addr, slot); ok {
 		t.Fatal("disabled cache must miss")
 	}
 	c.SetEnabled(true)
-	if _, ok := c.Get(common.Hash{4}, common.Address{1}, common.Hash{2}); !ok {
+	if _, ok := lookup(c, root, addr, slot); !ok {
 		t.Fatal("re-enabled cache should still hold the entry")
 	}
 }
 
-func TestStorageCacheInvalidateAccount(t *testing.T) {
+func TestStorageCacheDrop(t *testing.T) {
 	c := NewStorageCache(32)
 	addr := common.Address{0x42}
-	c.Put(addr, common.Hash{1}, common.Hash{9})
-	c.Put(addr, common.Hash{2}, common.Hash{8})
-	c.EndCommit(common.Hash{1})
+	root1, root2 := common.Hash{1}, common.Hash{2}
+	seed(c, root1, addr, common.Hash{1}, common.Hash{9})
+	seed(c, root1, addr, common.Hash{2}, common.Hash{8})
 
-	// The account self-destructs in the next block.
-	c.InvalidateAccount(addr)
-	c.EndCommit(common.Hash{2})
-	if _, ok := c.Get(common.Hash{2}, addr, common.Hash{1}); ok {
-		t.Fatal("invalidated account still hits")
+	c.Drop(addr)
+	c.Commit(root2)
+	if _, ok := lookup(c, root2, addr, common.Hash{1}); ok {
+		t.Fatal("dropped account still hits")
 	}
-	// A later block writing the same account is live again.
-	c.Put(addr, common.Hash{1}, common.Hash{7})
-	c.EndCommit(common.Hash{3})
-	got, ok := c.Get(common.Hash{3}, addr, common.Hash{1})
+	seed(c, root2, addr, common.Hash{1}, common.Hash{7})
+	got, ok := lookup(c, root2, addr, common.Hash{1})
 	if !ok || got != (common.Hash{7}) {
 		t.Fatalf("got %v %v", got, ok)
 	}
 }
 
-// A single block may both destroy and recreate an account. The staged slots
-// are the new incarnation's and must survive the invalidation.
-func TestStorageCacheDestructAndRecreateInOneCommit(t *testing.T) {
+func TestStorageCacheDropThenRetain(t *testing.T) {
 	c := NewStorageCache(32)
 	addr := common.Address{0x42}
-	c.Put(addr, common.Hash{1}, common.Hash{9})
-	c.Put(addr, common.Hash{2}, common.Hash{8})
-	c.EndCommit(common.Hash{1})
+	seed(c, common.Hash{1}, addr, common.Hash{1}, common.Hash{9})
+	seed(c, common.Hash{1}, addr, common.Hash{2}, common.Hash{8})
 
-	c.InvalidateAccount(addr)
-	c.Put(addr, common.Hash{1}, common.Hash{7})
-	c.EndCommit(common.Hash{2})
+	c.Drop(addr)
+	fresh := map[common.Hash]common.Hash{common.Hash{1}: common.Hash{7}}
+	c.Retain(addr, fresh)
+	c.Commit(common.Hash{2})
 
-	got, ok := c.Get(common.Hash{2}, addr, common.Hash{1})
+	got, ok := lookup(c, common.Hash{2}, addr, common.Hash{1})
 	if !ok || got != (common.Hash{7}) {
 		t.Fatalf("recreated slot = %v %v, want 0x07 true", got, ok)
 	}
-	if _, ok := c.Get(common.Hash{2}, addr, common.Hash{2}); ok {
+	if _, ok := lookup(c, common.Hash{2}, addr, common.Hash{2}); ok {
 		t.Fatal("slot from the destroyed incarnation still hits")
 	}
 }
 
-// Staged slots must stay invisible until EndCommit publishes them; that is
-// what stops a reverted call from being observable.
-func TestStorageCacheStagedNotVisibleUntilCommit(t *testing.T) {
+func TestStorageCacheInPlaceGrow(t *testing.T) {
 	c := NewStorageCache(16)
 	addr := common.Address{0xaa}
+	root1, root2 := common.Hash{1}, common.Hash{2}
 	slot, val := common.Hash{1}, common.Hash{9}
 
-	c.EndCommit(common.Hash{1})
-	c.Put(addr, slot, val)
-	if _, ok := c.Get(common.Hash{1}, addr, slot); ok {
-		t.Fatal("staged slot visible before EndCommit")
+	c.Commit(root1)
+	m := c.Adopt(root1, addr)
+	if m != nil {
+		t.Fatal("empty cache should not adopt")
 	}
-	c.EndCommit(common.Hash{2})
-	if got, ok := c.Get(common.Hash{2}, addr, slot); !ok || got != val {
-		t.Fatalf("published slot = %v %v, want %v true", got, ok, val)
+	m = map[common.Hash]common.Hash{slot: val}
+	c.Retain(addr, m)
+	c.Commit(root1)
+
+	// The adopted map is the same pointer; growing it in place is the hit.
+	held := c.Adopt(root1, addr)
+	if held == nil {
+		t.Fatal("expected adopt")
+	}
+	held[common.Hash{2}] = common.Hash{8}
+	c.Retain(addr, held)
+	c.Commit(root2)
+
+	if got := c.Len(); got != 2 {
+		t.Fatalf("len = %d, want 2", got)
+	}
+	if _, ok := lookup(c, root2, addr, common.Hash{2}); !ok {
+		t.Fatal("in-place write lost")
 	}
 }
 
 func TestStorageCachePurge(t *testing.T) {
 	c := NewStorageCache(8)
-	c.Put(common.Address{1}, common.Hash{1}, common.Hash{1})
-	c.EndCommit(common.Hash{2})
+	seed(c, common.Hash{2}, common.Address{1}, common.Hash{1}, common.Hash{1})
 	c.Purge()
 	if c.Root() != (common.Hash{}) {
 		t.Fatal("purge should drop the root tag")
 	}
-	if _, ok := c.Get(common.Hash{2}, common.Address{1}, common.Hash{1}); ok {
+	if _, ok := lookup(c, common.Hash{2}, common.Address{1}, common.Hash{1}); ok {
 		t.Fatal("purged cache still hits")
 	}
 }
 
-func TestStorageCacheOverBudgetEvicts(t *testing.T) {
-	c := NewStorageCache(1)
-	a1, a2 := common.Address{1}, common.Address{2}
-	c.Put(a1, common.Hash{1}, common.Hash{9})
-	c.Put(a2, common.Hash{1}, common.Hash{8})
-	c.EndCommit(common.Hash{1})
-	if st := c.Stats(); st.Evictions == 0 {
-		t.Fatal("expected an eviction on a 1-entry budget")
-	}
-	if got := c.Len(); got != 1 {
-		t.Fatalf("cache holds %d entries, want 1", got)
-	}
-}
-
-// When the cache is over budget the slots this block touched must be the ones
-// retained, since they are the likeliest to be read again.
-func TestStorageCacheEvictionKeepsCurrentBlock(t *testing.T) {
-	const budget = 4
-	c := NewStorageCache(budget)
-	addr := common.Address{1}
-	key := func(i int) common.Hash { return common.Hash{0xff, byte(i)} }
-
-	for i := 0; i < budget; i++ {
-		c.Put(addr, key(i), common.Hash{byte(i)})
-	}
-	c.EndCommit(common.Hash{1})
-
-	for i := budget; i < 2*budget; i++ {
-		c.Put(addr, key(i), common.Hash{byte(i)})
-	}
-	c.EndCommit(common.Hash{2})
-
-	if got := c.Len(); got != budget {
-		t.Fatalf("cache holds %d entries, want %d", got, budget)
-	}
-	for i := budget; i < 2*budget; i++ {
-		if got, ok := c.Get(common.Hash{2}, addr, key(i)); !ok || got != (common.Hash{byte(i)}) {
-			t.Fatalf("slot %d from the current block was evicted (%v %v)", i, got, ok)
-		}
-	}
-}
-
-// The base is only rebuilt occasionally, so entries have to stay readable
-// whether they currently sit in the delta or have been folded into the base.
-func TestStorageCacheSurvivesFolds(t *testing.T) {
-	const (
-		budget   = 1024
-		blocks   = 40
-		perBlock = 8
-	)
-	c := NewStorageCache(budget)
-	addr := common.Address{1}
-	key := func(i int) common.Hash { return common.Hash{0xff, byte(i >> 8), byte(i)} }
-	val := func(i int) common.Hash { return common.Hash{0x01, byte(i >> 8), byte(i)} }
-
-	var root common.Hash
-	for blk := 0; blk < blocks; blk++ {
-		for j := 0; j < perBlock; j++ {
-			i := blk*perBlock + j
-			c.Put(addr, key(i), val(i))
-		}
-		root = common.Hash{byte(blk + 1)}
-		c.EndCommit(root)
-	}
-
-	if got, want := c.Len(), blocks*perBlock; got != want {
-		t.Fatalf("cache holds %d entries, want %d", got, want)
-	}
-	for i := 0; i < blocks*perBlock; i++ {
-		if got, ok := c.Get(root, addr, key(i)); !ok || got != val(i) {
-			t.Fatalf("slot %d = %v %v, want %v true", i, got, ok, val(i))
-		}
-	}
-	if st := c.Stats(); st.Evictions != 0 {
-		t.Fatalf("evicted while inside the budget: %+v", st)
-	}
-}
-
-// A self-destruct has to reach entries that were already folded into the base,
-// not just the recent ones in the delta.
-func TestStorageCacheInvalidateReachesBase(t *testing.T) {
-	c := NewStorageCache(1024)
-	addr := common.Address{0x42}
-	other := common.Address{0x43}
-	c.Put(addr, common.Hash{1}, common.Hash{9})
-	c.Put(other, common.Hash{1}, common.Hash{8})
-	c.EndCommit(common.Hash{1})
-
-	// Idle commits push the entries out of the delta and into the base.
-	var root common.Hash
-	for i := 0; i <= foldEveryNth; i++ {
-		root = common.Hash{0xa0, byte(i)}
-		c.EndCommit(root)
-	}
-	if _, ok := c.Get(root, addr, common.Hash{1}); !ok {
-		t.Fatal("entry lost across the fold")
-	}
-
-	c.InvalidateAccount(addr)
-	root = common.Hash{0xb0}
-	c.EndCommit(root)
-	if _, ok := c.Get(root, addr, common.Hash{1}); ok {
-		t.Fatal("self-destructed slot survived in the base")
-	}
-	if _, ok := c.Get(root, other, common.Hash{1}); !ok {
-		t.Fatal("an unrelated account was dropped")
-	}
-}
-
-func TestStorageCacheStatsGating(t *testing.T) {
+func TestStorageCacheRetag(t *testing.T) {
 	c := NewStorageCache(8)
-	addr := common.Address{0xaa}
-	slot, val := common.Hash{1}, common.Hash{9}
-	c.Put(addr, slot, val)
-	c.EndCommit(common.Hash{1})
-
-	c.Get(common.Hash{1}, addr, slot)
-	c.Get(common.Hash{1}, addr, common.Hash{0xee})
-	st := c.Stats()
-	if st.Hits != 0 || st.Misses != 0 {
-		t.Fatalf("hits/misses counted while stats are off: %+v", st)
+	addr := common.Address{1}
+	seed(c, common.Hash{1}, addr, common.Hash{1}, common.Hash{9})
+	c.Commit(common.Hash{2})
+	if c.Root() != (common.Hash{2}) {
+		t.Fatalf("root = %s", c.Root())
 	}
-	if st.Inserts == 0 {
-		t.Fatal("inserts should be counted regardless of the stats flag")
+	if _, ok := lookup(c, common.Hash{1}, addr, common.Hash{1}); ok {
+		t.Fatal("old root still hits")
 	}
-
-	c.SetStatsEnabled(true)
-	c.Get(common.Hash{1}, addr, slot)
-	c.Get(common.Hash{1}, addr, common.Hash{0xee})
-	if st := c.Stats(); st.Hits != 1 || st.Misses != 1 {
-		t.Fatalf("hits=%d misses=%d, want 1 and 1", st.Hits, st.Misses)
+	if _, ok := lookup(c, common.Hash{2}, addr, common.Hash{1}); !ok {
+		t.Fatal("new root missed")
 	}
-}
-
-func TestStorageCacheRace(t *testing.T) {
-	c := NewStorageCache(256)
-	c.SetStatsEnabled(true)
-	root := common.Hash{1}
-	c.EndCommit(root)
-
-	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func(id byte) {
-			defer wg.Done()
-			addr := common.Address{id}
-			for j := 0; j < 200; j++ {
-				slot := common.Hash{byte(j)}
-				c.Put(addr, slot, common.Hash{id, byte(j)})
-				c.Get(root, addr, slot)
-				c.Get(c.Root(), addr, slot)
-			}
-		}(byte(i + 1))
-	}
-	// Republish snapshots underneath the readers.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for j := 0; j < 100; j++ {
-			c.EndCommit(root)
-		}
-	}()
-	wg.Wait()
 }
 
 func TestKeccakCacheHitRequiresFullInput(t *testing.T) {
@@ -370,8 +243,8 @@ func TestNilCachesAreDisabled(t *testing.T) {
 	if s.Enabled() || k.Enabled() {
 		t.Fatal("nil caches must report disabled")
 	}
-	if _, ok := s.Get(common.Hash{}, common.Address{}, common.Hash{}); ok {
-		t.Fatal("nil storage get")
+	if s.Adopt(common.Hash{}, common.Address{}) != nil {
+		t.Fatal("nil storage adopt")
 	}
 	if _, ok := k.Get(nil); ok {
 		t.Fatal("nil keccak get")

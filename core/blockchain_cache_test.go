@@ -64,9 +64,9 @@ func TestStorageCacheReorgPurges(t *testing.T) {
 	if cache == nil {
 		t.Fatal("storage cache was not attached")
 	}
-	cache.Put(addr, slot, common.Hash{0x11})
-	cache.EndCommit(chain.CurrentBlock().Root)
-	if _, ok := cache.Get(chain.CurrentBlock().Root, addr, slot); !ok {
+	cache.Retain(addr, map[common.Hash]common.Hash{slot: common.Hash{0x11}})
+	cache.Commit(chain.CurrentBlock().Root)
+	if m := cache.Adopt(chain.CurrentBlock().Root, addr); m == nil {
 		t.Fatal("pre-reorg cache insert missed")
 	}
 	cache.ResetStats()
@@ -77,7 +77,7 @@ func TestStorageCacheReorgPurges(t *testing.T) {
 	if cache.Stats().Purges == 0 {
 		t.Fatal("reorg did not purge the storage cache")
 	}
-	if _, ok := cache.Get(chain.CurrentBlock().Root, addr, slot); ok {
+	if m := cache.Adopt(chain.CurrentBlock().Root, addr); m != nil {
 		t.Fatal("stale storage cache entry survived the reorg")
 	}
 }
