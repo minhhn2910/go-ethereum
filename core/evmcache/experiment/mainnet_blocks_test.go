@@ -39,6 +39,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/tests"
 	"github.com/ethereum/go-ethereum/triedb"
@@ -146,23 +147,35 @@ func loadBlocks(t testing.TB) []blockFixture {
 
 func loadNamedBlocks(t testing.TB, names []string) []blockFixture {
 	t.Helper()
+	return loadNamedBlocksAt(t, blockDataDir(), names, false)
+}
+
+// loadNamedBlocksAt reads <root>/<block>/<tx hash>/txTest.json. fatalOnMissing
+// turns a missing block directory, or a block with nothing to replay, into a
+// failure. The three-block test leaves it false so a machine without that
+// capture still skips instead of failing the package.
+func loadNamedBlocksAt(t testing.TB, root string, blocks []string, fatalOnMissing bool) []blockFixture {
+	t.Helper()
 	var out []blockFixture
-	for _, num := range names {
-		dir := filepath.Join(blockDataDir(), num)
+	for _, num := range blocks {
+		dir := filepath.Join(root, num)
 		entries, err := os.ReadDir(dir)
 		if err != nil {
+			if fatalOnMissing {
+				t.Fatalf("block data unavailable (%v)", err)
+			}
 			t.Skipf("block data unavailable (%v)", err)
 		}
-		names := make([]string, 0, len(entries))
+		txNames := make([]string, 0, len(entries))
 		for _, e := range entries {
 			if e.IsDir() {
-				names = append(names, e.Name())
+				txNames = append(txNames, e.Name())
 			}
 		}
-		sort.Strings(names)
+		sort.Strings(txNames)
 
-		blk := blockFixture{total: len(names)}
-		for _, name := range names {
+		blk := blockFixture{total: len(txNames)}
+		for _, name := range txNames {
 			raw, err := os.ReadFile(filepath.Join(dir, name, "txTest.json"))
 			if err != nil {
 				continue
@@ -178,6 +191,9 @@ func loadNamedBlocks(t testing.TB, names []string) []blockFixture {
 			blk.txs = append(blk.txs, f)
 		}
 		if len(blk.txs) == 0 {
+			if fatalOnMissing {
+				t.Fatalf("no transactions parsed for block %s", num)
+			}
 			t.Skipf("no transactions parsed for block %s", num)
 		}
 		blk.number = mustU64(t, blk.env.Number)
@@ -286,12 +302,19 @@ type replayOpts struct {
 	warmStart bool
 
 	pathStats bool
+
+	// chain is the fork rules for ApplyMessage. Nil keeps the original
+	// three-block harness on Shanghai.
+	chain *params.ChainConfig
 }
 
 // replay runs every transaction of every block against one StateDB, committing
 // at each block boundary so the storage cache is exercised across blocks.
 func replay(t testing.TB, blocks []blockFixture, opts replayOpts) replayResult {
-	config := tests.Forks["Shanghai"]
+	config := opts.chain
+	if config == nil {
+		config = tests.Forks["Shanghai"]
+	}
 	sc, kc := opts.storage, opts.keccak
 
 	sdb := state.NewDatabase(triedb.NewDatabase(rawdb.NewMemoryDatabase(), nil), nil)
@@ -490,9 +513,9 @@ func maxSpread(ms []measurement) float64 {
 // measureConfigs runs every configuration repeats times, rotating which one
 // goes first so no arm keeps a privileged position in the cache-warmth and
 // scheduling order, and forcing a GC before each measured pass.
-func measureConfigs(t *testing.T, blocks []blockFixture, configs []cacheConfig, warmStart bool, repeats int) []measurement {
+func measureConfigs(t *testing.T, blocks []blockFixture, configs []cacheConfig, warmStart bool, repeats int, chain *params.ChainConfig) []measurement {
 	build := func(c cacheConfig) replayOpts {
-		o := replayOpts{warmStart: warmStart}
+		o := replayOpts{warmStart: warmStart, chain: chain}
 		if c.storage {
 			o.storage = newStorageCache(c.storageSize)
 		}
@@ -605,8 +628,11 @@ func writeOverlap(b *strings.Builder, blocks []blockFixture) {
 				reused++
 			}
 		}
-		fmt.Fprintf(b, "| %d | %d | %d | %.1f%% |\n", blk.number, len(cur), reused,
-			100*float64(reused)/float64(len(cur)))
+		share := 0.0
+		if len(cur) > 0 {
+			share = 100 * float64(reused) / float64(len(cur))
+		}
+		fmt.Fprintf(b, "| %d | %d | %d | %.1f%% |\n", blk.number, len(cur), reused, share)
 		for k := range cur {
 			seen[k] = true
 		}
@@ -651,7 +677,7 @@ func TestMainnetBlocksCacheImpact(t *testing.T) {
 		{name: "both on", storage: true, keccak: true, storageSize: evmcache.DefaultStorageSlots},
 	}
 
-	cold := measureConfigs(t, blocks, configs, false, mainnetRepeats)
+	cold := measureConfigs(t, blocks, configs, false, mainnetRepeats, nil)
 	requireSameWork(t, configs, cold)
 
 	base := cold[0].last
@@ -703,7 +729,7 @@ func TestMainnetBlocksCacheImpact(t *testing.T) {
 	// Upper bound. Genesis here is the union of every transaction's declared
 	// pre-state, so keeping what it staged hands the cache exactly the slots
 	// the three blocks are about to read.
-	warm := measureConfigs(t, blocks, configs, true, mainnetRepeats)
+	warm := measureConfigs(t, blocks, configs, true, mainnetRepeats, nil)
 	requireSameWork(t, configs, warm)
 	fmt.Fprintf(&b, "\n### Pre-warmed cache (upper bound): every slot these blocks read is already cached\n\n")
 	writeSummary(&b, configs, warm)
